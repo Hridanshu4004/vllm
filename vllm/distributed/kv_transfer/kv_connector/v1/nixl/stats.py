@@ -23,7 +23,29 @@ if TYPE_CHECKING:
 
 @dataclass
 class NixlKVConnectorStats(KVConnectorStats):
-    """Container for transfer performance metrics"""
+    """Container for NIXL KV transfer performance metrics.
+
+     Lifecycle:
+         1. Workers record transfer telemetry via `record_transfer()` into `self.data`.
+         2. Worker/scheduler stats containers are merged via `aggregate()`.
+         3. Periodic logging reduces stats via `reduce()` for CLI output, while
+            Prometheus metrics observe raw values via `NixlPromMetrics.observe()`.
+
+    Distributed & TP Semantics:
+         Telemetry is recorded per worker rank for each NIXL transfer operation.
+         - `num_successful_transfers`: Count of individual NIXL transfer handles
+           completed across participating worker ranks.
+         - `bytes_transferred`: Payload bytes transferred per recorded handle on a rank.
+         - `Throughput (MB/s)`: Total transferred MB divided by the sum of transfer
+           durations across recorded operations.
+
+         With tensor parallelism (TP > 1), each participating TP rank can record
+         its own transfer sample for a single logical request. `bytes_transferred`
+         and `Avg MB per transfer` therefore reflect per-rank, per-handle payloads,
+         not the full request's aggregate KV payload across all ranks. Transfer
+         durations from different TP ranks may also overlap in wall-clock time,
+         so summed durations should not be read as sequential elapsed time.
+    """
 
     def __post_init__(self):
         if not self.data:
@@ -43,6 +65,17 @@ class NixlKVConnectorStats(KVConnectorStats):
         }
 
     def record_transfer(self, res: "nixlXferTelemetry"):
+        """Record telemetry for a completed NIXL transfer operation.
+
+        Args:
+            res: Telemetry object from NIXL handle:
+                - `xferDuration`: Transfer duration in microseconds (us),
+                  converted to seconds.
+                - `postDuration`: Post-processing duration in microseconds (us),
+                  converted to seconds.
+                - `totalBytes`: Bytes transferred for this handle on worker rank.
+                - `descCount`: Number of memory descriptors transferred.
+        """
         # Keep metrics units consistent with rest of the code: time us->s
         self.data["transfer_duration"].append(res.xferDuration / 1e6)
         self.data["post_duration"].append(res.postDuration / 1e6)
@@ -76,6 +109,11 @@ class NixlKVConnectorStats(KVConnectorStats):
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        """Aggregate telemetry observations from another stats container.
+
+        Extends internal list accumulators with observation series collected
+        across worker ranks or engine steps.
+        """
         if not other.is_empty():
             for k, v in other.data.items():
                 accumulator = self.data[k]
@@ -84,6 +122,28 @@ class NixlKVConnectorStats(KVConnectorStats):
         return self
 
     def reduce(self) -> dict[str, int | float]:
+        """Reduce collected telemetry observations for CLI logging output.
+
+        Returns:
+            dict[str, int | float]: Formatted summary metrics:
+                - `Num successful transfers`: Total count of recorded transfer
+                  operations completed across participating worker ranks.
+                - `Avg xfer time (ms)`: Mean transfer duration across recorded
+                  operations (ms).
+                - `P90 xfer time (ms)`: 90th percentile transfer duration (ms).
+                - `Avg post time (ms)`: Mean post-processing duration (ms).
+                - `P90 post time (ms)`: 90th percentile post-processing
+                  duration (ms).
+                - `Avg MB per transfer`: Mean payload size per recorded transfer
+                  operation (MB).
+                - `Throughput (MB/s)`: Ratio of total MB transferred to the
+                  sum of transfer durations (total_mb / total_time_seconds).
+                  Summing durations reflects total bytes divided by cumulative
+                  transfer time across operations rather than wall-clock
+                  interval duration.
+                - `Avg number of descriptors`: Mean number of descriptors per
+                  transfer.
+        """
         # Compute compact representative stats suitable for CLI logging
         if self.num_successful_transfers == 0:
             # CLI logging only reports successful transfers stats. If all requests in
@@ -110,6 +170,7 @@ class NixlKVConnectorStats(KVConnectorStats):
         total_mb = mb.sum()
         avg_mb = total_mb / n
 
+        # Sum of individual transfer durations across recorded transfers
         total_time_seconds = xfer_time.sum()
         throughput_mb_s = total_mb / total_time_seconds
 
@@ -130,6 +191,14 @@ class NixlKVConnectorStats(KVConnectorStats):
 
 
 class NixlPromMetrics(KVConnectorPromMetrics):
+    """Prometheus metrics collector for NIXL KV Cache transfers.
+
+    Registers per-engine histograms (`vllm:nixl_xfer_time_seconds`,
+    `vllm:nixl_post_time_seconds`, `vllm:nixl_bytes_transferred`,
+    `vllm:nixl_num_descriptors`) and counters (`vllm:nixl_num_failed_transfers`,
+    `vllm:nixl_num_failed_notifications`, `vllm:nixl_num_kv_expired_reqs`).
+    """
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -238,6 +307,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         )
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        """Observe recorded NIXL transfer telemetry series in Prometheus metrics."""
         for prom_obj, list_item_key in zip(
             [
                 self.nixl_histogram_xfer_time,
